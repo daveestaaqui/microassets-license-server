@@ -1,16 +1,14 @@
 import os
 import json
-import hmac
-import hashlib
 import secrets
-from http.server import BaseHTTPRequestHandler, HTTPServer
+from flask import Flask, request, jsonify
 
 # ============================================
 # MicroAssets License Key Validation Server
-# Deploy on Railway.app (Hobby Mode, $5/mo)
 # ============================================
 
-# In production, use env vars:
+app = Flask(__name__)
+
 STRIPE_WEBHOOK_SECRET = os.environ.get("STRIPE_WEBHOOK_SECRET", "whsec_PLACEHOLDER")
 LICENSE_DB_FILE = "licenses.json"
 
@@ -28,88 +26,71 @@ def generate_license_key():
     parts = [secrets.token_hex(2).upper() for _ in range(4)]
     return '-'.join(parts)
 
-class LicenseHandler(BaseHTTPRequestHandler):
-    def do_GET(self):
-        """Validate a license key: GET /validate?key=XXXX-XXXX-XXXX-XXXX"""
-        if self.path.startswith('/validate'):
-            params = dict(p.split('=') for p in self.path.split('?')[1].split('&'))
-            key = params.get('key', '')
-            db = load_licenses()
-            
-            if key in db and db[key]['status'] == 'active':
-                self._respond(200, {"valid": True, "product": db[key]['product']})
-            else:
-                self._respond(403, {"valid": False, "error": "Invalid or expired license key"})
-        elif self.path == '/health':
-            self._respond(200, {"status": "ok", "licenses": len(load_licenses())})
-        else:
-            self._respond(404, {"error": "Not found"})
+@app.route('/health')
+def health():
+    db = load_licenses()
+    return jsonify({"status": "ok", "licenses": len(db)})
 
-    def do_POST(self):
-        """Handle Stripe webhook: POST /webhook"""
-        if self.path == '/webhook':
-            content_length = int(self.headers.get('Content-Length', 0))
-            body = self.rfile.read(content_length).decode('utf-8')
-            
-            # In production, verify Stripe signature
-            # sig = self.headers.get('Stripe-Signature', '')
-            
-            try:
-                event = json.loads(body)
-                event_type = event.get('type', '')
-                
-                db = load_licenses()
-                
-                if event_type == 'checkout.session.completed':
-                    customer_email = event['data']['object'].get('customer_email', 'unknown')
-                    product_name = event['data']['object'].get('metadata', {}).get('product', 'unknown')
-                    
-                    key = generate_license_key()
-                    db[key] = {
-                        "email": customer_email,
-                        "product": product_name,
-                        "status": "active",
-                        "created": event['data']['object'].get('created', 0)
-                    }
-                    save_licenses(db)
-                    print(f"✅ New license generated: {key} for {customer_email}")
-                    self._respond(200, {"license_key": key})
-                    
-                elif event_type == 'customer.subscription.deleted':
-                    customer_email = event['data']['object'].get('customer_email', '')
-                    # Revoke all keys for this customer
-                    revoked = 0
-                    for key, data in db.items():
-                        if data.get('email') == customer_email:
-                            data['status'] = 'revoked'
-                            revoked += 1
-                    save_licenses(db)
-                    print(f"🔒 Revoked {revoked} licenses for {customer_email}")
-                    self._respond(200, {"revoked": revoked})
-                    
-                else:
-                    self._respond(200, {"ignored": True})
-                    
-            except Exception as e:
-                self._respond(400, {"error": str(e)})
-        else:
-            self._respond(404, {"error": "Not found"})
+@app.route('/')
+def index():
+    return jsonify({"service": "MicroAssets License Server", "version": "2.0"})
 
-    def _respond(self, code, data):
-        self.send_response(code)
-        self.send_header('Content-Type', 'application/json')
-        self.send_header('Access-Control-Allow-Origin', '*')
-        self.end_headers()
-        self.wfile.write(json.dumps(data).encode())
+@app.route('/validate')
+def validate():
+    key = request.args.get('key', '').strip().upper()
+    db = load_licenses()
+    
+    if key in db and db[key].get('status') == 'active':
+        return jsonify({"valid": True, "product": db[key]['product']})
+    else:
+        return jsonify({"valid": False, "error": "Invalid or expired license key"}), 403
 
-    def log_message(self, format, *args):
-        print(f"[{self.log_date_time_string()}] {format % args}")
+@app.route('/webhook', methods=['POST'])
+def webhook():
+    body = request.get_json(force=True)
+    event_type = body.get('type', '')
+    db = load_licenses()
+    
+    if event_type == 'checkout.session.completed':
+        obj = body.get('data', {}).get('object', {})
+        customer_email = obj.get('customer_details', {}).get('email', 
+                         obj.get('customer_email', 'unknown'))
+        
+        # Get product from metadata, line items, or client_reference_id
+        product_name = obj.get('client_reference_id', 
+                       obj.get('metadata', {}).get('product', 'unknown'))
+        
+        key = generate_license_key()
+        db[key] = {
+            "email": customer_email,
+            "product": product_name,
+            "status": "active",
+            "created": obj.get('created', 0)
+        }
+        save_licenses(db)
+        print(f"✅ New license: {key} for {customer_email} ({product_name})")
+        return jsonify({"license_key": key})
+        
+    elif event_type == 'customer.subscription.deleted':
+        obj = body.get('data', {}).get('object', {})
+        customer_email = obj.get('customer_email', '')
+        revoked = 0
+        for k, data in db.items():
+            if data.get('email') == customer_email:
+                data['status'] = 'revoked'
+                revoked += 1
+        save_licenses(db)
+        return jsonify({"revoked": revoked})
+    
+    return jsonify({"ignored": True})
+
+@app.after_request
+def add_cors(response):
+    response.headers['Access-Control-Allow-Origin'] = '*'
+    response.headers['Access-Control-Allow-Headers'] = 'Content-Type'
+    return response
 
 if __name__ == '__main__':
     port = int(os.environ.get('PORT', 8080))
-    server = HTTPServer(('0.0.0.0', port), LicenseHandler)
-    print(f"🔐 MicroAssets License Server running on port {port}")
-    print(f"   Health: http://localhost:{port}/health")
-    print(f"   Validate: http://localhost:{port}/validate?key=XXXX-XXXX-XXXX-XXXX")
-    print(f"   Webhook: POST http://localhost:{port}/webhook")
-    server.serve_forever()
+    print(f"🔐 MicroAssets License Server on port {port}")
+    app.run(host='0.0.0.0', port=port)
