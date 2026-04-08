@@ -1,6 +1,6 @@
-# MicroAssets License Server
+# SporlyWorks License Server
 
-A lightweight Python license key validation server for the MicroAssets Chrome Extension suite.
+A lightweight Python license key validation server for the SporlyWorks Chrome Extension suite.
 
 ## Deploy to Railway
 
