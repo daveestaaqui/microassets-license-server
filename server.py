@@ -9,6 +9,8 @@ import shutil
 import re
 import uuid
 import stripe
+import jwt
+from werkzeug.security import generate_password_hash, check_password_hash
 from flask import Flask, request, jsonify, abort, redirect
 from functools import wraps
 
@@ -42,8 +44,10 @@ if not ADMIN_SECRET:
 
 # Use Railway persistent volume if available, else local
 LICENSE_DB_FILE = os.environ.get("LICENSE_DB_PATH", "/app/data/licenses.json")
+USERS_DB_FILE = os.environ.get("USERS_DB_PATH", "/app/data/users.json")
 BACKUP_DIR = os.path.join(os.path.dirname(LICENSE_DB_FILE), "backups")
 RATE_LIMIT_FILE = os.path.join(os.path.dirname(LICENSE_DB_FILE), "rate_limits.json")
+JWT_SECRET = os.environ.get("OMNISUITE_SECRET", "super-secret-default-jwts")
 
 # Allowed CORS origins
 ALLOWED_ORIGINS = [
@@ -260,6 +264,58 @@ def validate_license_key_format(key):
 
 
 # ============================================
+# User Database Operations
+# ============================================
+
+def load_users():
+    """Load users database."""
+    if os.path.exists(USERS_DB_FILE):
+        try:
+            with open(USERS_DB_FILE) as f:
+                data = json.load(f)
+            if not isinstance(data, dict):
+                raise ValueError("Users DB is not a dict")
+            return data
+        except (json.JSONDecodeError, ValueError) as e:
+            print(f"❌ CRITICAL: Users DB corrupted: {e}")
+            return {}
+    return {}
+
+def save_users(db):
+    """Save users database with atomic write."""
+    create_backup(USERS_DB_FILE)
+    atomic_write_json(USERS_DB_FILE, db)
+
+def get_current_user():
+    auth_header = request.headers.get("Authorization", "")
+    if not auth_header.startswith("Bearer "):
+        return None
+    token = auth_header.split(" ")[1]
+    try:
+        data = jwt.decode(token, JWT_SECRET, algorithms=["HS256"])
+        users = load_users()
+        user_id = data.get("user_id")
+        if user_id in users:
+            return users[user_id], user_id
+    except jwt.ExpiredSignatureError:
+        pass
+    except jwt.InvalidTokenError:
+        pass
+    return None
+
+def login_required(f):
+    @wraps(f)
+    def decorated_function(*args, **kwargs):
+        if request.method == 'OPTIONS':
+            return '', 200
+        user_tuple = get_current_user()
+        if not user_tuple:
+            return jsonify({"error": "Unauthorized"}), 401
+        return f(*args, **kwargs)
+    return decorated_function
+
+
+# ============================================
 # Request ID Middleware
 # ============================================
 
@@ -312,6 +368,14 @@ def metrics():
     for v in db.values():
         p = v.get('product', 'unknown')
         products[p] = products.get(p, 0) + 1
+        
+    users_db = load_users()
+    total_users = len(users_db)
+    pro_users = sum(1 for u in users_db.values() if u.get('tier') == 'Pro Suite')
+    free_users = total_users - pro_users
+    
+    conversion_rate = round((pro_users / total_users * 100), 2) if total_users > 0 else 0
+    estimated_mrr = pro_users * 49
     
     # Backup health
     backup_count = 0
@@ -323,6 +387,11 @@ def metrics():
         "active": active,
         "revoked": revoked,
         "products": products,
+        "total_users": total_users,
+        "pro_users": pro_users,
+        "free_users": free_users,
+        "conversion_rate": conversion_rate,
+        "estimated_mrr": estimated_mrr,
         "backup_count": backup_count,
         "db_path": LICENSE_DB_FILE,
         "db_size_bytes": os.path.getsize(LICENSE_DB_FILE) if os.path.exists(LICENSE_DB_FILE) else 0,
@@ -375,6 +444,112 @@ def poll():
     return jsonify({"ready": False})
 
 
+# ============================================
+# Auth & Monetization Endpoints
+# ============================================
+
+@app.route('/api/auth/register', methods=['POST', 'OPTIONS'])
+def register():
+    if request.method == 'OPTIONS':
+        return '', 200
+    data = request.get_json(silent=True) or {}
+    email = data.get('email', '').strip().lower()
+    password = data.get('password', '')
+    
+    if not email or not password or len(password) < 6:
+        return jsonify({"error": "Invalid email or password (min 6 chars)"}), 400
+        
+    users = load_users()
+    for uid, u in users.items():
+        if u.get('email') == email:
+            return jsonify({"error": "Email already registered"}), 409
+            
+    user_id = str(uuid.uuid4())
+    users[user_id] = {
+        "email": email,
+        "password_hash": generate_password_hash(password, method="pbkdf2:sha256"),
+        "tier": "Free",
+        "created_at": time.time()
+    }
+    save_users(users)
+    
+    token = jwt.encode({
+        "user_id": user_id,
+        "exp": time.time() + 7 * 24 * 3600
+    }, JWT_SECRET, algorithm="HS256")
+    
+    return jsonify({"token": token, "user_id": user_id, "tier": "Free"}), 201
+
+
+@app.route('/api/auth/login', methods=['POST', 'OPTIONS'])
+def login():
+    if request.method == 'OPTIONS':
+        return '', 200
+    data = request.get_json(silent=True) or {}
+    email = data.get('email', '').strip().lower()
+    password = data.get('password', '')
+    
+    users = load_users()
+    for uid, u in users.items():
+        if u.get('email') == email:
+            if check_password_hash(u.get('password_hash'), password):
+                token = jwt.encode({
+                    "user_id": uid,
+                    "exp": time.time() + 7 * 24 * 3600
+                }, JWT_SECRET, algorithm="HS256")
+                return jsonify({"token": token, "user_id": uid, "tier": u.get('tier', 'Free')})
+            break
+            
+    return jsonify({"error": "Invalid credentials"}), 401
+
+
+@app.route('/api/user/me', methods=['GET', 'OPTIONS'])
+@login_required
+def user_me():
+    user, uid = get_current_user()
+    return jsonify({
+        "email": user.get('email'),
+        "tier": user.get('tier', 'Free'),
+        "stripe_customer_id": user.get('stripe_customer_id'),
+        "created_at": user.get('created_at')
+    })
+
+
+@app.route('/api/checkout/create-session', methods=['POST', 'OPTIONS'])
+@login_required
+def create_checkout_session():
+    user, uid = get_current_user()
+    if user.get('tier') == 'Pro Suite':
+        # Even if Pro, we may allow billing view/update, but redirecting to Stripe billing portal
+        return jsonify({"error": "Already subscribed to Pro Suite"}), 400
+        
+    data = request.get_json(silent=True) or {}
+    plan_type = data.get('plan', 'monthly') # or 'annual'
+    
+    stripe.api_key = os.environ.get("STRIPE_SECRET_KEY")
+    if not stripe.api_key:
+        return jsonify({"error": "Stripe is not configured on the server"}), 500
+        
+    try:
+        # We would lookup the price ID based on plan_type and actual setup
+        price_id = os.environ.get(f"STRIPE_PRICE_{plan_type.upper()}", "price_mock")
+        domain_url = request.headers.get("Origin", "https://sporlyworks.com")
+        
+        checkout_session = stripe.checkout.Session.create(
+            success_url=domain_url + "/dashboard.html?session_id={CHECKOUT_SESSION_ID}&success=true",
+            cancel_url=domain_url + "/pricing.html",
+            payment_method_types=["card"],
+            mode="subscription",
+            client_reference_id=uid,
+            customer_email=user.get('email'),
+            line_items=[{"price": price_id, "quantity": 1}],
+            metadata={"product": "Pro Suite"}
+        )
+        return jsonify({"checkoutUrl": checkout_session.url})
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
+
 @app.route('/webhook', methods=['POST'])
 def webhook():
     # ================================================
@@ -424,6 +599,16 @@ def webhook():
             "request_id": request.request_id
         }
         save_licenses(db)
+        
+        # Upgrade User Tier
+        if client_ref:
+            users = load_users()
+            if client_ref in users:
+                users[client_ref]['tier'] = 'Pro Suite'
+                users[client_ref]['stripe_customer_id'] = obj.get('customer')
+                save_users(users)
+                print(f"✅ Upgraded user tier to Pro Suite for user {client_ref}")
+                
         print(f"✅ New license (Auto-Unlock): {key} for {customer_email} [UUID: {client_ref}] [req:{request.request_id}]")
         return jsonify({"received": True})
         
@@ -437,6 +622,16 @@ def webhook():
                 data['revoked_at'] = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
                 revoked += 1
         save_licenses(db)
+        
+        # Downgrade User Tier
+        customer_id = obj.get('customer', '')
+        if customer_id or customer_email:
+            users = load_users()
+            for uid, u in users.items():
+                if u.get('stripe_customer_id') == customer_id or u.get('email') == customer_email:
+                    u['tier'] = 'Free'
+            save_users(users)
+            
         print(f"🔒 Revoked {revoked} licenses for {customer_email} [req:{request.request_id}]")
         return jsonify({"revoked": revoked})
     
@@ -458,13 +653,13 @@ def add_security_headers(response):
     origin = request.headers.get('Origin', '')
     
     # CORS: Allow sporlyworks.com and Chrome extensions
-    if any(origin.startswith(allowed) for allowed in ALLOWED_ORIGINS):
+    if any(origin.startswith(allowed) for allowed in ALLOWED_ORIGINS) or origin.startswith("http://localhost") or origin.startswith("http://127.0.0.1"):
         response.headers['Access-Control-Allow-Origin'] = origin
     elif not origin:
         # Server-to-server requests (no Origin header) — allow for webhooks
         response.headers['Access-Control-Allow-Origin'] = 'https://sporlyworks.com'
     
-    response.headers['Access-Control-Allow-Headers'] = 'Content-Type, X-Admin-Key'
+    response.headers['Access-Control-Allow-Headers'] = 'Content-Type, X-Admin-Key, Authorization'
     response.headers['Access-Control-Allow-Methods'] = 'GET, POST, OPTIONS'
     
     # Security headers
@@ -478,7 +673,7 @@ def add_security_headers(response):
         response.headers['Strict-Transport-Security'] = 'max-age=31536000; includeSubDomains'
     
     # Cache control — never cache authenticated endpoints
-    if request.path in ('/validate', '/poll', '/webhook', '/metrics'):
+    if request.path in ('/validate', '/poll', '/webhook', '/metrics') or request.path.startswith('/api/'):
         response.headers['Cache-Control'] = 'no-store, no-cache, must-revalidate, max-age=0'
         response.headers['Pragma'] = 'no-cache'
     
