@@ -1,0 +1,8 @@
+{
+  "7ac3bcfb-bc09-44cc-9bec-8eabaf7a2025": {
+    "email": "david@sporlyworks.com",
+    "password_hash": "pbkdf2:sha256:600000$GaeAQEFrIpDjnh3Z$9849f0bf32579056e0637cc33af5c7ae50e53e83dc5a69669d12b88d78c698c5",
+    "tier": "Free",
+    "created_at": 1776382140.411108
+  }
+}

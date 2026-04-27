@@ -45,6 +45,7 @@ if not ADMIN_SECRET:
 # Use Railway persistent volume if available, else local
 LICENSE_DB_FILE = os.environ.get("LICENSE_DB_PATH", "/app/data/licenses.json")
 USERS_DB_FILE = os.environ.get("USERS_DB_PATH", "/app/data/users.json")
+ANALYTICS_DB_FILE = os.environ.get("ANALYTICS_DB_PATH", "/app/data/analytics.json")
 BACKUP_DIR = os.path.join(os.path.dirname(LICENSE_DB_FILE), "backups")
 RATE_LIMIT_FILE = os.path.join(os.path.dirname(LICENSE_DB_FILE), "rate_limits.json")
 JWT_SECRET = os.environ.get("OMNISUITE_SECRET", "super-secret-default-jwts")
@@ -286,6 +287,20 @@ def save_users(db):
     create_backup(USERS_DB_FILE)
     atomic_write_json(USERS_DB_FILE, db)
 
+def load_analytics():
+    """Load analytics database."""
+    if os.path.exists(ANALYTICS_DB_FILE):
+        try:
+            with open(ANALYTICS_DB_FILE) as f:
+                return json.load(f)
+        except (json.JSONDecodeError, ValueError):
+            return {}
+    return {}
+
+def save_analytics(db):
+    """Save analytics database with atomic write."""
+    atomic_write_json(ANALYTICS_DB_FILE, db)
+
 def get_current_user():
     auth_header = request.headers.get("Authorization", "")
     if not auth_header.startswith("Bearer "):
@@ -382,6 +397,8 @@ def metrics():
     if os.path.isdir(BACKUP_DIR):
         backup_count = len([f for f in os.listdir(BACKUP_DIR) if f.endswith('.bak')])
     
+    analytics_db = load_analytics()
+    
     return jsonify({
         "total_keys": len(db),
         "active": active,
@@ -392,12 +409,33 @@ def metrics():
         "free_users": free_users,
         "conversion_rate": conversion_rate,
         "estimated_mrr": estimated_mrr,
+        "funnel": analytics_db,
         "backup_count": backup_count,
         "db_path": LICENSE_DB_FILE,
         "db_size_bytes": os.path.getsize(LICENSE_DB_FILE) if os.path.exists(LICENSE_DB_FILE) else 0,
         "environment": ENVIRONMENT,
         "request_id": request.request_id
     })
+
+@app.route('/api/track', methods=['POST', 'OPTIONS'])
+def track_event():
+    """Endpoint for tracking funnel events."""
+    if request.method == 'OPTIONS':
+        return '', 204
+    data = request.get_json()
+    if not data or 'event' not in data:
+        return jsonify({"error": "Missing event"}), 400
+        
+    event_name = data['event']
+    
+    # Optional logic to track specific user paths if user_id is provided
+    # user_id = data.get('user_id')
+    
+    db = load_analytics()
+    db[event_name] = db.get(event_name, 0) + 1
+    save_analytics(db)
+    
+    return jsonify({"status": "ok"}), 200
 
 
 @app.route('/validate')
@@ -473,6 +511,10 @@ def register():
     }
     save_users(users)
     
+    analytics = load_analytics()
+    analytics['register_user'] = analytics.get('register_user', 0) + 1
+    save_analytics(analytics)
+    
     token = jwt.encode({
         "user_id": user_id,
         "exp": time.time() + 7 * 24 * 3600
@@ -493,6 +535,13 @@ def login():
     for uid, u in users.items():
         if u.get('email') == email:
             if check_password_hash(u.get('password_hash'), password):
+                if not u.get('has_logged_in'):
+                    u['has_logged_in'] = True
+                    save_users(users)
+                    analytics = load_analytics()
+                    analytics['login_first_time'] = analytics.get('login_first_time', 0) + 1
+                    save_analytics(analytics)
+                    
                 token = jwt.encode({
                     "user_id": uid,
                     "exp": time.time() + 7 * 24 * 3600
@@ -545,6 +594,11 @@ def create_checkout_session():
             line_items=[{"price": price_id, "quantity": 1}],
             metadata={"product": "Pro Suite"}
         )
+        
+        analytics = load_analytics()
+        analytics['initiate_checkout'] = analytics.get('initiate_checkout', 0) + 1
+        save_analytics(analytics)
+        
         return jsonify({"checkoutUrl": checkout_session.url})
     except Exception as e:
         return jsonify({"error": str(e)}), 500
@@ -608,6 +662,10 @@ def webhook():
                 users[client_ref]['stripe_customer_id'] = obj.get('customer')
                 save_users(users)
                 print(f"✅ Upgraded user tier to Pro Suite for user {client_ref}")
+                
+        analytics = load_analytics()
+        analytics['success_conversion'] = analytics.get('success_conversion', 0) + 1
+        save_analytics(analytics)
                 
         print(f"✅ New license (Auto-Unlock): {key} for {customer_email} [UUID: {client_ref}] [req:{request.request_id}]")
         return jsonify({"received": True})
